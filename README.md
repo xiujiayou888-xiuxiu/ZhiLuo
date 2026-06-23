@@ -117,7 +117,7 @@ SQLite handles it fine. The graph engine (NetworkX) starts to slow down around 5
 Those are great. ZhiLuo is for people who want something local, free, MCP-native, and don't want to configure a stack of services.
 
 **Who made this?**
-A chef from Sichuan who got annoyed that AI agents forget everything. Built with AI assistance — the product design, architecture decisions, and iteration direction are human; the code execution is AI-driven.
+An independent developer who got annoyed that AI agents forget everything. Built with AI assistance — the product design, architecture decisions, and iteration direction are human; the code execution is AI-driven.
 
 ---
 
