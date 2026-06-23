@@ -68,6 +68,33 @@ Then your AI agent gets 19 tools: `learn`, `query`, `search`, `analyze`, `deep_r
 
 ---
 
+## License & Pricing
+
+ZhiLuo is **source-available with a 7-day free trial**.
+
+| | Free Trial (7 days) | Pro (one-time purchase) |
+|---|---|---|
+| **Knowledge storage** | Unlimited | Unlimited |
+| **Query / Search / Visualize** | Always free | Always free |
+| **Learn (write new knowledge)** | 7 days | Permanent |
+| **Deep Reason** | 7 days | Permanent |
+| **Manage (edit/delete/backup)** | 7 days | Permanent |
+| **Conflict Detection** | 7 days | Permanent |
+| **Passive Monitoring** | 7 days | Permanent |
+| **After trial ends** | Read-only mode | Full access forever |
+
+**Why?** Building and maintaining this takes real work. The trial lets you verify it works for your setup. If it saves you time, consider supporting it.
+
+### How to Activate
+
+1. After trial ends, run `license_status` to get your machine code
+2. [Contact for license](mailto:your-email@here.com) with your machine code
+3. Receive activation code → run `activate(activation_code='XXXX')` → unlocked permanently
+
+Source code is fully open. If you're a developer who wants to modify it for your own use — go ahead. The license check is lightweight and doesn't phone home.
+
+---
+
 ## Architecture
 
 ```
@@ -123,4 +150,4 @@ An independent developer who got annoyed that AI agents forget everything. Built
 
 ## License
 
-MIT — do whatever you want. Just don't blame me if your agent becomes too smart.
+Source-available. Free to use, modify, and redistribute for non-commercial purposes. The 7-day trial applies to write operations; read operations are always free. Commercial use requires a Pro license. Just don't blame me if your agent becomes too smart.
