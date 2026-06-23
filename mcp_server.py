@@ -18,6 +18,7 @@ except ImportError:
 from engine import ZhiLuo, pagerank, SelfCheck, mermaid_graph, entangle as _entangle, auto_learn as _auto_learn
 from brain_wrapper import create_brain
 from graph_wrapper import ZhiLuoGraph
+from license import check_license, get_status as _license_status, activate as _activate_license, get_machine_code
 
 # ========== 全局异常保护 ==========
 def _safe_call(expr_or_lambda):
@@ -73,6 +74,11 @@ except Exception:
 def learn(text: str, auto: bool = False) -> str:
     """记住新知识。auto=True 时提取到待确认队列。支持自动去重合并。"""
     _inject_chat("user", text, "学习")
+    lic = _lic_check()
+    if lic and not auto:
+        return lic + "\n[知络] 试用到期后只能查询，无法学习新知识。"
+    if lic and auto:
+        return lic
     if auto:
         ids = _auto_learn(lb.s, text)
         if not ids:
@@ -224,6 +230,10 @@ def export(fmt: str = "json", keyword: str = "") -> str:
 def manage(action: str, text: str = "", new_text: str = "") -> str:
     """综合管理。action: update=修改知识, delete=删除知识, correct=纠正词义, backup=备份, history=变更历史, rule=关系规则, llm=LLM模式。"""
     _inject_chat("user", action, "管理")
+    if action in ("update", "delete", "correct"):
+        lic = _lic_check()
+        if lic:
+            return lic + "\n[知络] 试用到期后只能查询，无法修改知识。"
     if action == "backup": return _safe_call(lambda: _lb.run("备份"))
     if action == "history": return _safe_call(lambda: _lb.run("记忆列表"))
     if action == "update": return _safe_call(lambda: _lb.run("修改" + text + " 改成 " + new_text))
@@ -472,6 +482,9 @@ def workspace(action: str = "switch", name: str = "global", backup_path: str = "
 def deep_reason(question: str, mode: str = "auto") -> str:
     """深度推理引擎。mode: auto=深度推理(拆解→检索→多角度分析→打分→报告), quantum=量子级关联(加权纠缠场+语义叠加传播), neural=神经扩散(多跳带阈值截断的语义激活传播)。"""
     _inject_chat("user", question, "深度推理")
+    lic = _lic_check()
+    if lic:
+        return lic + "\n[知络] 深度推理为Pro版功能，试用到期后不可用。查询/搜索仍可使用。"
     try:
         from deep_engine import deep_reason as _dr, quantum_assoc, neural_diffuse
     except ImportError:
@@ -911,9 +924,58 @@ def _full_selfcheck() -> str:
     return "\n".join(lines)
 
 
+# ==================== 许可证 ====================
+
+_license_cache = None
+def _lic_check():
+    """许可证检查（带缓存，60秒刷新一次）"""
+    global _license_cache
+    now = int(__import__('time').time())
+    if _license_cache and now - _license_cache['ts'] < 60:
+        status = _license_cache['status']
+    else:
+        status = _license_status()
+        _license_cache = {'status': status, 'ts': now}
+    
+    if status['status'] == 'expired':
+        mc = status['machine_code']
+        return (
+            f"[知络] 7天试用已到期。\n"
+            f"你的机器码：{mc}\n"
+            f"购买激活码请联系作者。\n"
+            f"激活命令：activate(activation_code='你的激活码')"
+        )
+    return None
+
+@mcp.tool()
+def activate(activation_code: str) -> str:
+    """激活知络Pro版。输入购买获得的激活码，永久解锁全部功能。"""
+    ok = _activate_license(activation_code)
+    if ok:
+        global _license_cache
+        _license_cache = {'status': _license_status(), 'ts': int(__import__('time').time())}
+        return "[知络] 激活成功！Pro版已永久解锁，尽情使用。"
+    return "[知络] 激活失败，激活码无效。请确认：\n1. 激活码是否完整（16位大写字母数字）\n2. 是否在正确的电脑上使用（激活码绑定本机）"
+
+@mcp.tool()
+def license_status() -> str:
+    """查看知络许可证状态（试用剩余天数/已激活/已到期）"""
+    s = _license_status()
+    mc = s['machine_code']
+    if s['status'] == 'activated':
+        return f"[知络] 状态：已激活 Pro版 ✅"
+    if s['status'] == 'expired':
+        return f"[知络] 状态：试用已到期 ❌\n机器码：{mc}\n如需继续使用，请联系作者获取激活码。"
+    return f"[知络] 状态：试用中 🕐\n剩余 {s['days_left']} 天\n机器码：{mc}\n到期后需激活才能继续使用。"
+
+
 # ==================== 启动 ====================
 if __name__ == "__main__":
     try:
+        # 启动时打印许可证状态
+        s = _license_status()
+        sys.stderr.write(f"[知络] 许可证: {s['status']} 剩余{s['days_left']}天 机器码:{s['machine_code'][:8]}...\n")
+        sys.stderr.flush()
         mcp.run(transport="stdio")
     finally:
         try:
