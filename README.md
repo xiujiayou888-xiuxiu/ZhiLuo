@@ -35,6 +35,7 @@ pip install jieba networkx
 
 ```python
 from zhiluo_loader import ZhiLuo
+
 lb = ZhiLuo()
 
 # Store knowledge
@@ -68,46 +69,19 @@ Then your AI agent gets 19 tools: `learn`, `query`, `search`, `analyze`, `deep_r
 
 ---
 
-## License & Pricing
-
-ZhiLuo is **source-available with a 7-day free trial**.
-
-| | Free Trial (7 days) | Pro (one-time purchase) |
-|---|---|---|
-| **Knowledge storage** | Unlimited | Unlimited |
-| **Query / Search / Visualize** | Always free | Always free |
-| **Learn (write new knowledge)** | 7 days | Permanent |
-| **Deep Reason** | 7 days | Permanent |
-| **Manage (edit/delete/backup)** | 7 days | Permanent |
-| **Conflict Detection** | 7 days | Permanent |
-| **Passive Monitoring** | 7 days | Permanent |
-| **After trial ends** | Read-only mode | Full access forever |
-
-**Why?** Building and maintaining this takes real work. The trial lets you verify it works for your setup. If it saves you time, consider supporting it.
-
-### How to Activate
-
-1. After trial ends, run `license_status` to get your machine code
-2. [Contact for license](mailto:your-email@here.com) with your machine code
-3. Receive activation code → run `activate(activation_code='XXXX')` → unlocked permanently
-
-Source code is fully open. If you're a developer who wants to modify it for your own use — go ahead. The license check is lightweight and doesn't phone home.
-
----
-
 ## Architecture
 
 ```
 User Input
     ↓
-v8.2 Incremental Layer (intent classification → genre detection → context binding)
+v8.6 Incremental Layer (intent classification → genre detection → context binding)
     ↓
 v7.1 Solid Base (jieba tokenization → SimHash dedup → FTS5 index → SQLite store)
     ↓
 Knowledge Graph (NetworkX) + Passive Monitor (background health checks)
 ```
 
-- **20+ modules**, 7 compiled to `.pyd` for performance
+- **27 modules**, all in pure Python (no compiled binaries required)
 - Three-tier index: Hash (O(1)) → Keyword → FTS5 full-text
 - Progressive degradation: missing jieba? Falls back to character-split. No sqlite-vec? Falls back to TF-IDF.
 
@@ -128,7 +102,24 @@ Knowledge Graph (NetworkX) + Passive Monitor (background health checks)
 | `genre_retrieval.py` | Genre-aware search (process/argument/definition/data/dialogue) |
 | `tools.py` | Utilities: visualize, export, backup/restore |
 | `zhiluo_loader.py` | Entry point |
-| `build/` | Compiled `.pyd` modules (7 files) |
+| `emerge_engine.py` | Knowledge emergence: surface hidden patterns |
+| `user_profiler.py` | User profile tracking and drift detection |
+| `chat_log.py` | Conversation logging and replay |
+
+---
+
+## Comparison
+
+| Feature | ZhiLuo | Mem0 | Zep | LangChain Memory |
+|---|---|---|---|---|
+| **100% Local** | ✅ | ❌ (cloud default) | ❌ (cloud default) | ✅ |
+| **Zero Token Cost** | ✅ | ❌ | ❌ | ❌ |
+| **Knowledge Graph** | ✅ 6-type + PageRank | ❌ | ✅ basic | ❌ |
+| **Conflict Detection** | ✅ Triple | ❌ | ❌ | ❌ |
+| **Deep Reasoning** | ✅ Built-in | ❌ | ❌ | ❌ |
+| **Self-Healing** | ✅ 14 checks | ❌ | ❌ | ❌ |
+| **MCP Native** | ✅ 19 tools | ❌ | ❌ | ❌ |
+| **Setup** | `pip install` | Docker + API key | Docker + API key | pip + config |
 
 ---
 
@@ -148,6 +139,25 @@ An independent developer who got annoyed that AI agents forget everything. Built
 
 ---
 
+## Roadmap
+
+- [ ] PyPI package (`pip install zhiluo`)
+- [ ] MCP official directory listing
+- [ ] Neo4j backend for 100K+ scale
+- [ ] English NLP support (spaCy integration)
+- [ ] Cloud sync option (optional, self-hosted)
+- [ ] Pro tier: team collaboration, cloud backup, priority support
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome! If ZhiLuo saves you time, consider giving it a ⭐ — it helps others discover it.
+
 ## License
 
-Source-available. Free to use, modify, and redistribute for non-commercial purposes. The 7-day trial applies to write operations; read operations are always free. Commercial use requires a Pro license. Just don't blame me if your agent becomes too smart.
+MIT License — use it, modify it, build on it. Just don't blame me if your agent becomes too smart.
+
+## Contact
+
+Questions or ideas? Reach out: [18599936462@coze.email](mailto:18599936462@coze.email)

@@ -1,13 +1,19 @@
+# Compiled modules - source .py files are provided instead
+*.pyd
+*.pyc
+*.pyo
+*.so
+*.egg-info/
+dist/
+build/
+
 # Data files - user's knowledge stays local
 data/
 brain_data/
+*.db
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
 
 # IDE
 .vscode/
@@ -16,3 +22,6 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test
+test_*
