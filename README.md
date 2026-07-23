@@ -1,163 +1,126 @@
-# ZhiLuo — Give Your AI Agent a Persistent Brain
+# 知络基础版
 
-AI agents are smart, but they forget everything the moment a conversation ends. Every chat starts from zero. **ZhiLuo fixes that.**
+单Agent本地知识库 — 帮你沉淀资料、复盘、踩坑和可复用经验。
 
-A lightweight, local, MCP-native memory engine. No cloud, no API bills, no setup nightmares. Just persistent memory that works.
-
----
-
-## What Makes It Different
-
-Most agent memory solutions are either cloud-locked paywalls or half-baked wrappers around a vector DB. ZhiLuo does things differently:
-
-| Feature | What It Means |
-|---|---|
-| **Triple Conflict Detection** | Catches contradictory facts — explicit edges + semantic similarity + numeric comparison. Your knowledge base doesn't silently rot. |
-| **Deep Reasoning Engine** | Breaks questions down, retrieves from multiple angles, scores conclusions. Not just search — actual reasoning chains. |
-| **Passive Monitoring** | Background health checks. Detects knowledge surges, profile drift, contradiction accumulation. Alerts before things break. |
-| **6-Type Knowledge Graph** | related / causes / contradicts / hypernym / associates / precedes. PageRank surfaces what matters most. |
-| **Cross-Conversation Memory** | Three-layer context (short/mid/long term). Agent remembers across sessions, across days. |
-| **Self-Healing** | 14 health checks + 8 auto-fixes. Corrupted index? Fixed. Broken graph? Rebuilt. |
-| **Confidence Decay** | 30-day half-life. Old unverified facts quietly fade, fresh knowledge rises. |
-| **Pure Local** | SQLite + FTS5 + jieba. Zero API calls. Zero latency. Your data stays on your machine. |
+**定位**：完整版（46工具 / 15元月）的精简版，保留23个核心工具，6.8元/月。
 
 ---
 
-## Quick Start
+## 快速安装
 
-### Install
+### 1. 环境要求
+- Python 3.10+
+- Windows / macOS / Linux
 
+### 2. 一键安装
+```bat
+install.bat
+```
+
+或手动：
 ```bash
-pip install jieba networkx
+python -m venv venv
+venv\Scripts\python -m pip install --upgrade pip
+venv\Scripts\pip install -r requirements.txt
 ```
 
-### 3 Lines to a Brain
+### 3. MCP配置
 
-```python
-from zhiluo_loader import ZhiLuo
-
-lb = ZhiLuo()
-
-# Store knowledge
-lb.run("记住: 牛肉批发价从35涨到了48，涨幅37%")
-
-# Search
-lb.run("牛肉现在什么价")
-
-# Cross-conversation recall
-brain = lb.brain
-brain.get_context("供应商价格变动")
-```
-
-### Use as MCP Server
-
-Add to your MCP config:
+在你的Agent配置文件中添加（Codex/WorkBuddy/ZCode等）：
 
 ```json
 {
   "mcpServers": {
-    "zhiluo": {
-      "command": "python",
-      "args": ["mcp_server.py"],
-      "cwd": "/path/to/zhiluo"
+    "zhiluo-basic": {
+      "command": "D:/skill项目/知络-基础版/venv/Scripts/python.exe",
+      "args": ["D:/skill项目/知络-基础版/mcp_server.py"],
+      "env": {}
     }
   }
 }
 ```
 
-Then your AI agent gets 19 tools: `learn`, `query`, `search`, `analyze`, `deep_reason`, `selfcheck`, `visualize`, `summarize`, and more.
+### 4. 首次使用
+
+对AI说：`setup(action="quick")`
+
+或指定路径：`setup(action="quick", kb_path="D:/my-knowledge")`
 
 ---
 
-## Architecture
+## 22个MCP工具
 
+### 基础知识循环（8个）
+| 工具 | 功能 |
+|------|------|
+| `pre_answer_context` | 回答前检索相关记忆 |
+| `learn` | 写入知识（SimHash/MinHash去重合并） |
+| `note` | 快速记录（轻量learn） |
+| `query` | 关键词搜索（FTS5+SimHash多策略） |
+| `search` | 图扩散关联搜索 |
+| `stats` | 知识库统计概览 |
+| `selfcheck` | 14项系统自检+修复 |
+| `setup` | 首次配置向导 |
+
+### 分析推理（5个）
+| 工具 | 功能 |
+|------|------|
+| `qa` | 本地知识库问答（TF-IDF，不依赖外部LLM） |
+| `reason` | 推理分析（检索+关联扩散+聚合） |
+| `summarize` | 长文本摘要 |
+| `analyze` | 冲突检测 + 信任衰减分析 |
+| `visualize` | Mermaid知识图谱可视化 |
+
+### 实用工具（6个）
+| 工具 | 功能 |
+|------|------|
+| `pitfall` | 踩坑记录（list/report/search） |
+| `export` | 导出JSON/Markdown |
+| `manage` | 编辑/更新/删除知识 |
+| `history` | 最近写入历史 |
+| `pending` | 待审核知识列表 |
+| `confirm` | 确认待审核知识 |
+
+### 系统管理（4个）
+| 工具 | 功能 |
+|------|------|
+| `configure` | 查看/修改配置项 |
+| `maintain` | 知识库维护（分类+补边+修复） |
+| `workspace` | 多工作区切换 |
+| `obsidian_sync` | **Obsidian 双向同步**（导出/导入） |
+
+---
+
+## 与完整版的区别
+
+| 特性 | 基础版 (6.8元/月) | 完整版 (15元/月) |
+|------|-------------------|-------------------|
+| 知识读写 | ✅ | ✅ |
+| 本地问答 | ✅ | ✅ |
+| 踩坑记录 | ✅ | ✅ |
+| 知识维护 | ✅ 基础 | ✅ 高级（日报/合成/自动学习） |
+| 多Agent共享 | ❌ | ✅ |
+| 后台自动扫描 | ❌ | ✅ 每日9:00/23:00 |
+| Obsidian同步 | ✅ | ✅ |
+| AI雷达/RSS | ❌ | ✅ |
+| 争议裁决 | ❌ | ✅ |
+| 深度推理 | ❌ | ✅ 认知匕首+深度推理 |
+| 自动合成 | ❌ | ✅ |
+| 报告生成 | ❌ | ✅ 周报/洞察 |
+| PPT导出 | ❌ | ✅ |
+| 向量语义搜索 | ❌ | ✅ |
+| 工具数量 | 23个 | 46个 |
+
+---
+
+## 可选：配置LLM
+
+在项目根目录创建 `.env` 文件：
+
+```env
+ZHILUO_LLM_API_KEY=sk-your-api-key
+ZHILUO_LLM_API_URL=https://api.deepseek.com/v1/chat/completions
+ZHILUO_LLM_MODEL=deepseek-chat
 ```
-User Input
-    ↓
-v8.6 Incremental Layer (intent classification → genre detection → context binding)
-    ↓
-v7.1 Solid Base (jieba tokenization → SimHash dedup → FTS5 index → SQLite store)
-    ↓
-Knowledge Graph (NetworkX) + Passive Monitor (background health checks)
-```
 
-- **27 modules**, all in pure Python (no compiled binaries required)
-- Three-tier index: Hash (O(1)) → Keyword → FTS5 full-text
-- Progressive degradation: missing jieba? Falls back to character-split. No sqlite-vec? Falls back to TF-IDF.
-
----
-
-## File Map
-
-| File | Purpose |
-|---|---|
-| `engine.py` | Core: SimHash, MemoryStore, Intent classification |
-| `brain_wrapper.py` | High-level wrapper, ties everything together |
-| `mcp_server.py` | MCP protocol server, 19 tools |
-| `deep_engine.py` | Deep reasoning: decompose → retrieve → analyze → score |
-| `semantic_conflict.py` | Triple conflict detection |
-| `passive_engine.py` | Background health monitoring |
-| `graph_engine.py` | NetworkX knowledge graph, PageRank |
-| `context_memory.py` | Three-layer cross-conversation memory |
-| `genre_retrieval.py` | Genre-aware search (process/argument/definition/data/dialogue) |
-| `tools.py` | Utilities: visualize, export, backup/restore |
-| `zhiluo_loader.py` | Entry point |
-| `emerge_engine.py` | Knowledge emergence: surface hidden patterns |
-| `user_profiler.py` | User profile tracking and drift detection |
-| `chat_log.py` | Conversation logging and replay |
-
----
-
-## Comparison
-
-| Feature | ZhiLuo | Mem0 | Zep | LangChain Memory |
-|---|---|---|---|---|
-| **100% Local** | ✅ | ❌ (cloud default) | ❌ (cloud default) | ✅ |
-| **Zero Token Cost** | ✅ | ❌ | ❌ | ❌ |
-| **Knowledge Graph** | ✅ 6-type + PageRank | ❌ | ✅ basic | ❌ |
-| **Conflict Detection** | ✅ Triple | ❌ | ❌ | ❌ |
-| **Deep Reasoning** | ✅ Built-in | ❌ | ❌ | ❌ |
-| **Self-Healing** | ✅ 14 checks | ❌ | ❌ | ❌ |
-| **MCP Native** | ✅ 19 tools | ❌ | ❌ | ❌ |
-| **Setup** | `pip install` | Docker + API key | Docker + API key | pip + config |
-
----
-
-## FAQ
-
-**Is this production-ready?**
-It's running in production on my own AI agent setup. It's stable, but the MCP ecosystem is young. Test with your own use case first.
-
-**Can it handle 100K+ knowledge entries?**
-SQLite handles it fine. The graph engine (NetworkX) starts to slow down around 50K nodes. Future versions will add Neo4j backend.
-
-**Why not use mem0 / Zep / LangChain Memory?**
-Those are great. ZhiLuo is for people who want something local, free, MCP-native, and don't want to configure a stack of services.
-
-**Who made this?**
-An independent developer who got annoyed that AI agents forget everything. Built with AI assistance — the product design, architecture decisions, and iteration direction are human; the code execution is AI-driven.
-
----
-
-## Roadmap
-
-- [ ] PyPI package (`pip install zhiluo`)
-- [ ] MCP official directory listing
-- [ ] Neo4j backend for 100K+ scale
-- [ ] English NLP support (spaCy integration)
-- [ ] Cloud sync option (optional, self-hosted)
-- [ ] Pro tier: team collaboration, cloud backup, priority support
-
----
-
-## Contributing
-
-Issues and pull requests are welcome! If ZhiLuo saves you time, consider giving it a ⭐ — it helps others discover it.
-
-## License
-
-MIT License — use it, modify it, build on it. Just don't blame me if your agent becomes too smart.
-
-## Contact
-
-Questions or ideas? Reach out: [18599936462@coze.email](mailto:18599936462@coze.email)
+配置后，`summarize` 和关系提取功能将获得更好的效果。

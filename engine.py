@@ -1,28 +1,68 @@
 # -*- coding: utf-8 -*-
 """
-知络 v8.3 — 天花板级记忆引擎（开源版）
+知络 v8.9.1 — 统一版记忆引擎（开源版）
 优化：jieba分词 + MinHashLSH去重 + LLM记忆合并 + sqlite-vec向量 + Mermaid可视化 + 返回截断
 架构：内存 hash 索引（O(1)）+ SQLite+FTS5 持久化 + 向量持久化
 """
 import re, json, math, os, sys, hashlib, sqlite3, threading, random, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict, deque, OrderedDict
+from security_utils import SecurityError, safe_workspace_db_path, validate_workspace_name
+from security_utils import ZhiLuoError, EngineError, ValidationError  # v8.9.7
 
 # ====================== jieba 分词（优化1）======================
 try:
     import jieba
     import jieba.analyse
+    try:
+        import logging as _logging
+        jieba.setLogLevel(_logging.ERROR)
+    except Exception:
+        import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
     _HAS_JIEBA = True
 except ImportError:
     _HAS_JIEBA = False
 
-def smart_tokenize(text):
+_TOKEN_TEXT_MAX_CHARS = int(os.environ.get("ZHILUO_TOKEN_TEXT_MAX_CHARS", "12000") or "12000")
+_TOKEN_MAX_TOKENS = int(os.environ.get("ZHILUO_TOKEN_MAX_TOKENS", "1500") or "1500")
+_LSH_MAX_TOKENS = int(os.environ.get("ZHILUO_LSH_MAX_TOKENS", "256") or "256")
+_TOKEN_CACHE_SIZE = int(os.environ.get("ZHILUO_TOKEN_CACHE_SIZE", "256") or "256")
+_TOKEN_CACHE = OrderedDict()
+_TOKEN_CACHE_LOCK = threading.Lock()
+
+
+def _clip_for_tokenize(text, max_chars=None):
+    """Use representative slices for token indexes; keep full text in SQLite/FTS."""
+    text = str(text or "")
+    limit = max(1000, int(max_chars or _TOKEN_TEXT_MAX_CHARS))
+    if len(text) <= limit:
+        return text
+    head = max(1, int(limit * 0.60))
+    mid = max(1, int(limit * 0.20))
+    tail = max(1, limit - head - mid)
+    start_mid = max(0, (len(text) - mid) // 2)
+    return text[:head] + "\n" + text[start_mid:start_mid + mid] + "\n" + text[-tail:]
+
+
+def _token_cache_key(text, max_chars=None, max_tokens=None):
+    clipped = _clip_for_tokenize(text, max_chars=max_chars)
+    raw = "%s:%s:%s" % (max_chars or _TOKEN_TEXT_MAX_CHARS, max_tokens or _TOKEN_MAX_TOKENS, clipped)
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest(), clipped
+
+
+def smart_tokenize(text, max_chars=None, max_tokens=None):
     """jieba 分词，无 jieba 时回退到单字切分"""
-    text = text.lower()
+    cache_key, clipped = _token_cache_key(text, max_chars=max_chars, max_tokens=max_tokens)
+    with _TOKEN_CACHE_LOCK:
+        cached = _TOKEN_CACHE.get(cache_key)
+        if cached is not None:
+            _TOKEN_CACHE.move_to_end(cache_key)
+            return list(cached)
+    text = clipped.lower()
     if _HAS_JIEBA:
         words = list(jieba.cut(text))
-        return [w.strip() for w in words if w.strip() and w.strip() not in SimHash._STOP]
+        result = [w.strip() for w in words if w.strip() and w.strip() not in SimHash._STOP]
     else:
         out = []
         for t in re.findall(r"[\w\u4e00-\u9fff]+", text):
@@ -30,7 +70,13 @@ def smart_tokenize(text):
                 out.extend(list(t))
             else:
                 out.append(t)
-        return [t for t in out if t not in SimHash._STOP]
+        result = [t for t in out if t not in SimHash._STOP]
+    result = result[:max(10, int(max_tokens or _TOKEN_MAX_TOKENS))]
+    with _TOKEN_CACHE_LOCK:
+        _TOKEN_CACHE[cache_key] = tuple(result)
+        while len(_TOKEN_CACHE) > _TOKEN_CACHE_SIZE:
+            _TOKEN_CACHE.popitem(last=False)
+    return list(result)
 
 def smart_extract_keywords(text, top_k=10):
     """jieba 关键词抽取，无 jieba 时回退到 TF-IDF"""
@@ -41,17 +87,32 @@ def smart_extract_keywords(text, top_k=10):
         freq = Counter(toks)
         return [w for w, _ in freq.most_common(top_k)]
 
+
+def fast_index_tokenize(text, max_chars=None, max_tokens=None):
+    """Fast fallback for loading old rows without text_jieba cache."""
+    text = _clip_for_tokenize(text, max_chars=max_chars).lower()
+    out = []
+    for token in re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]{2,6}", text):
+        if token and token not in SimHash._STOP:
+            out.append(token)
+        if len(out) >= max(10, int(max_tokens or _TOKEN_MAX_TOKENS)):
+            break
+    return out
+
 # ====================== SimHash（优化1: jieba分词）======================
 class SimHash:
     _STOP = set("的了是在我有和就不人都一个上也这到说他她你们这那之")
 
     @staticmethod
-    def tokens(text):
-        return smart_tokenize(text)
+    def tokens(text, max_chars=None, max_tokens=None):
+        return smart_tokenize(text, max_chars=max_chars, max_tokens=max_tokens)
 
     @staticmethod
     def hash(text):
-        toks = SimHash.tokens(text)
+        return SimHash.hash_tokens(SimHash.tokens(text))
+
+    @staticmethod
+    def hash_tokens(toks):
         if not toks:
             return 0
         v = [0] * 64
@@ -110,22 +171,38 @@ class MinHashLSH:
             keys.append((b, hash(chunk)))
         return keys
 
-    def insert(self, nid, text):
-        tokens = SimHash.tokens(text)
-        sig = self._signature(tokens)
+    def _bounded_tokens(self, tokens):
+        tokens = list(tokens or [])
+        limit = max(32, int(_LSH_MAX_TOKENS))
+        if len(tokens) <= limit:
+            return tokens
+        head = int(limit * 0.60)
+        mid = int(limit * 0.20)
+        tail = max(1, limit - head - mid)
+        start_mid = max(0, (len(tokens) - mid) // 2)
+        return tokens[:head] + tokens[start_mid:start_mid + mid] + tokens[-tail:]
+
+    def insert_tokens(self, nid, tokens):
+        sig = self._signature(self._bounded_tokens(tokens))
         for b, h in self._band_keys(sig):
             self._bands[b].setdefault(h, []).append(nid)
         return sig
 
-    def query(self, text):
+    def insert(self, nid, text):
+        return self.insert_tokens(nid, SimHash.tokens(text))
+
+    def query_tokens(self, tokens):
         """返回可能相似的节点 ID 列表"""
-        tokens = SimHash.tokens(text)
-        sig = self._signature(tokens)
+        sig = self._signature(self._bounded_tokens(tokens))
         candidates = set()
         for b, h in self._band_keys(sig):
             for nid in self._bands.get(b, {}).get(h, []):
                 candidates.add(nid)
         return list(candidates)
+
+    def query(self, text):
+        """返回可能相似的节点 ID 列表"""
+        return self.query_tokens(SimHash.tokens(text))
 
     def jaccard(self, text_a, text_b):
         sa = set(SimHash.tokens(text_a))
@@ -136,9 +213,15 @@ class MinHashLSH:
 
 # ====================== SQLite + 内存双引擎存储 ======================
 SKILL_DIR = Path(__file__).resolve().parent
-DATA_DIR = SKILL_DIR / "data"
+try:
+    from kb_config import get_data_dir, get_kb_path
+    DATA_DIR = Path(get_data_dir())
+    WS_DIR = Path(get_kb_path())
+except Exception:
+    DATA_DIR = SKILL_DIR / "data"
+    WS_DIR = DATA_DIR / "workspaces"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-WS_DIR = DATA_DIR / "workspaces"
+WS_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = DATA_DIR / "memory.db"
 EDGE_RELATED, EDGE_CAUSE = "related", "cause"
 EDGE_PART_OF, EDGE_SYNONYM = "part_of", "synonym"
@@ -150,8 +233,34 @@ class MemoryStore:
 
     _local = threading.local()
 
+    # v8.9.7: 允许通过 update() 修改的列名白名单（防 SQL 注入）
+    _ALLOWED_COLUMNS = {
+        "text", "category", "tags", "confidence", "trust_score",
+        "access_count", "last_accessed_at", "updated_at", "source",
+        "status", "visibility", "para", "edges_json", "simhash",
+        "created_by", "confirmed_by", "source_url", "content_hash",
+        "text_jieba", "workspace", "learned_at", "created_at",
+        "fetched_at", "session_id",
+    }
+    # v8.9.7: 允许 ALTER TABLE 的列声明白名单（从 _ensure_* 硬编码列表中提取）
+    _KNOWN_COLUMN_DECLS = {
+        "para": "TEXT DEFAULT ''",
+        "created_by": "TEXT DEFAULT 'default'",
+        "visibility": "TEXT DEFAULT 'team'",
+        "trust_score": "REAL DEFAULT 1.0",
+        "source_url": "TEXT DEFAULT ''",
+        "content_hash": "TEXT DEFAULT ''",
+        "fetched_at": "TEXT DEFAULT ''",
+        "status": "TEXT DEFAULT 'active'",
+        "confirmed_by": "TEXT DEFAULT ''",
+        "text_jieba": "TEXT DEFAULT ''",
+    }
+
     def __init__(self, path=None, workspace="global"):
-        self.path = Path(path) if path else WS_DIR / f"{workspace}.db"
+        workspace = validate_workspace_name(workspace)
+        self.path = Path(path) if path else safe_workspace_db_path(WS_DIR, workspace)
+        if path:
+            self.path = Path(path).resolve()
         self.ws = workspace
         self.nodes = []
         self.adj = {}
@@ -161,15 +270,18 @@ class MemoryStore:
         self.node_pos = {}
         self.lsh = MinHashLSH()
         self._next_id = 1
+        self._write_lock = threading.RLock()  # v8.9.7: 保护写操作线程安全
         self._init_db()
         self.load()
 
     def _get_conn(self):
         if not hasattr(MemoryStore._local, "conn") or MemoryStore._local.conn is None:
-            MemoryStore._local.conn = sqlite3.connect(str(self.path), check_same_thread=False)
+            MemoryStore._local.conn = sqlite3.connect(str(self.path), timeout=30, check_same_thread=False)
             MemoryStore._local.conn.execute("PRAGMA journal_mode=WAL")
+            MemoryStore._local.conn.execute("PRAGMA busy_timeout=30000")
             MemoryStore._local.conn.execute("PRAGMA foreign_keys=ON")
             MemoryStore._local.conn.execute("PRAGMA synchronous=NORMAL")
+            MemoryStore._local.conn.execute("PRAGMA cache_size=-65536")
             MemoryStore._local.conn.row_factory = sqlite3.Row
         else:
             try:
@@ -180,13 +292,16 @@ class MemoryStore:
                     my_path = str(self.path.resolve())
                     if curr_path != my_path:
                         MemoryStore._local.conn.close()
-                        MemoryStore._local.conn = sqlite3.connect(str(self.path), check_same_thread=False)
+                        MemoryStore._local.conn = sqlite3.connect(str(self.path), timeout=30, check_same_thread=False)
                         MemoryStore._local.conn.execute("PRAGMA journal_mode=WAL")
+                        MemoryStore._local.conn.execute("PRAGMA busy_timeout=30000")
                         MemoryStore._local.conn.execute("PRAGMA foreign_keys=ON")
                         MemoryStore._local.conn.execute("PRAGMA synchronous=NORMAL")
                         MemoryStore._local.conn.row_factory = sqlite3.Row
             except Exception:
-                pass
+                import logging as _logging
+                _logging.getLogger("zhiluo.engine").warning(
+                    "MemoryStore._get_conn: path validation failed, reusing existing connection", exc_info=True)
         return MemoryStore._local.conn
 
     def _close_conn(self):
@@ -215,7 +330,17 @@ class MemoryStore:
                 session_id TEXT,
                 source TEXT DEFAULT 'user',
                 edges_json TEXT DEFAULT '[]',
-                embedding BLOB
+                embedding BLOB,
+                para TEXT DEFAULT '',
+                created_by TEXT DEFAULT 'default',
+                visibility TEXT DEFAULT 'team',
+                trust_score REAL DEFAULT 1.0,
+                source_url TEXT DEFAULT '',
+                content_hash TEXT DEFAULT '',
+                fetched_at TEXT DEFAULT '',
+                status TEXT DEFAULT 'active',
+                confirmed_by TEXT DEFAULT '',
+                text_jieba TEXT DEFAULT ''
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
                 text, category, tags,
@@ -240,7 +365,8 @@ class MemoryStore:
         try:
             conn.execute("CREATE TABLE IF NOT EXISTS vec_nodes (id INTEGER PRIMARY KEY, embedding BLOB);")
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
+        self._ensure_v89_columns(conn)
         # === 超级版新增: pending待确认队列 + 变更历史 ===
         try:
             conn.executescript('''
@@ -250,7 +376,10 @@ class MemoryStore:
                     category TEXT,
                     workspace TEXT DEFAULT 'global',
                     source TEXT DEFAULT 'auto',
-                    created_at TEXT
+                    created_at TEXT,
+                    source_url TEXT DEFAULT '',
+                    content_hash TEXT DEFAULT '',
+                    source_hash TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS change_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,8 +391,91 @@ class MemoryStore:
                 );
             ''')
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
+        try:
+            self._ensure_pending_columns(conn)
+        except Exception:
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
+        # 常用查询索引
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_cat ON nodes(category)")
+        except Exception:
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_ws ON nodes(workspace)")
+        except Exception:
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_conf ON nodes(confidence)")
+        except Exception:
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
         conn.commit()
+
+    def _ensure_v89_columns(self, conn):
+        columns = [
+            ("para", "TEXT DEFAULT ''"),
+            ("created_by", "TEXT DEFAULT 'default'"),
+            ("visibility", "TEXT DEFAULT 'team'"),
+            ("trust_score", "REAL DEFAULT 1.0"),
+            ("source_url", "TEXT DEFAULT ''"),
+            ("content_hash", "TEXT DEFAULT ''"),
+            ("fetched_at", "TEXT DEFAULT ''"),
+            ("status", "TEXT DEFAULT 'active'"),
+            ("confirmed_by", "TEXT DEFAULT ''"),
+            ("text_jieba", "TEXT DEFAULT ''"),
+        ]
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+        for name, decl in columns:
+            if name not in existing:
+                # v8.9.7: 列名和声明白名单校验
+                if name not in self._KNOWN_COLUMN_DECLS or self._KNOWN_COLUMN_DECLS.get(name) != decl:
+                    import logging as _logging
+                    _logging.getLogger("zhiluo.engine").warning(
+                        "Skipping unknown column: %s %s", name, decl)
+                    continue
+                conn.execute("ALTER TABLE nodes ADD COLUMN %s %s" % (name, decl))
+
+    def _ensure_pending_columns(self, conn):
+        columns = [
+            ("source_url", "TEXT DEFAULT ''"),
+            ("content_hash", "TEXT DEFAULT ''"),
+            ("source_hash", "TEXT DEFAULT ''"),
+        ]
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(pending)").fetchall()}
+        for name, decl in columns:
+            if name not in existing:
+                # v8.9.7: 列名和声明白名单校验
+                if name not in self._KNOWN_COLUMN_DECLS and name not in {"source_hash"}:
+                    import logging as _logging
+                    _logging.getLogger("zhiluo.engine").warning(
+                        "Skipping unknown pending column: %s %s", name, decl)
+                    continue
+                conn.execute("ALTER TABLE pending ADD COLUMN %s %s" % (name, decl))
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_source_url ON pending(source_url)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_content_hash ON pending(content_hash)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_source_hash ON pending(source_hash)")
+
+    def _cached_tokens(self, node):
+        cached = str(node.get("text_jieba") or "").strip()
+        # Very old rows may contain full-document token dumps; splitting those
+        # recreates the load spike we are avoiding. Retokenize a bounded slice.
+        if cached and len(cached) <= _TOKEN_TEXT_MAX_CHARS * 4:
+            toks = [t for t in cached.split() if t and t not in SimHash._STOP]
+            if toks:
+                return toks[:_TOKEN_MAX_TOKENS]
+        return fast_index_tokenize(node.get("text", ""))
+
+    def _index_node_tokens(self, nid, tokens):
+        for kw in set(tokens):
+            self.kw_idx.setdefault(kw, []).append(nid)
+        self.lsh.insert_tokens(nid, tokens)
+
+    def _remove_node_tokens(self, nid, tokens):
+        for kw in set(tokens):
+            try:
+                self.kw_idx.get(kw, []).remove(nid)
+            except ValueError:
+                pass
 
     def load(self):
         self.nodes = []
@@ -281,39 +493,53 @@ class MemoryStore:
         conn = self._get_conn()
         try:
             cursor = conn.execute("SELECT * FROM nodes ORDER BY id")
-            for row in cursor.fetchall():
-                node = dict(row)
-                try:
-                    edges = json.loads(node.pop("edges_json", "[]"))
-                except (json.JSONDecodeError, TypeError):
-                    edges = []
-                node["edges"] = edges
-                try:
-                    tags = json.loads(node.get("tags", "[]"))
-                except (json.JSONDecodeError, TypeError):
-                    tags = []
-                node["tags"] = tags if isinstance(tags, list) else []
-                node.pop("minhash_sig", None)
-                node.pop("embedding", None)
-                self.nodes.append(node)
-                nid = node["id"]
-                self.node_pos[nid] = len(self.nodes) - 1
-                self.adj[nid] = []
-                sh = node.get("simhash", 0)
-                if sh:
-                    self.hash_idx[sh] = nid
-                bk = SimHash.bucket(sh)
-                self.sh_buckets.setdefault(bk, []).append(nid)
-                for kw in SimHash.tokens(node.get("text", "")):
-                    self.kw_idx.setdefault(kw, []).append(nid)
-                for e in edges:
-                    self.adj[nid].append(e)
-                    target = e.get("target")
-                    if target is not None:
-                        self.adj.setdefault(target, []).append(
-                            {"target": nid, "type": e.get("type", EDGE_RELATED), "weight": e.get("weight", 1.0)}
-                        )
-                self.lsh.insert(nid, node.get("text", ""))
+            load_batch = max(100, int(os.environ.get("ZHILUO_LOAD_BATCH", "2000") or "2000"))
+            while True:
+                rows = cursor.fetchmany(load_batch)
+                if not rows:
+                    break
+                for row in rows:
+                    node = dict(row)
+                    try:
+                        edges = json.loads(node.pop("edges_json", "[]"))
+                    except (json.JSONDecodeError, TypeError):
+                        edges = []
+                    # 兼容旧格式：过滤掉非 dict 的边条目
+                    edges = [e for e in (edges if isinstance(edges, list) else []) if isinstance(e, dict)]
+                    node["edges"] = edges
+                    try:
+                        tags = json.loads(node.get("tags", "[]"))
+                    except (json.JSONDecodeError, TypeError):
+                        tags = []
+                    node["tags"] = tags if isinstance(tags, list) else []
+                    node.pop("minhash_sig", None)
+                    node.pop("embedding", None)
+                    self.nodes.append(node)
+                    nid = node["id"]
+                    self.node_pos[nid] = len(self.nodes) - 1
+                    self.adj[nid] = []
+                    sh = node.get("simhash", 0)
+                    if sh:
+                        self.hash_idx[sh] = nid
+                    bk = SimHash.bucket(sh)
+                    self.sh_buckets.setdefault(bk, []).append(nid)
+                    index_tokens = self._cached_tokens(node)
+                    self._index_node_tokens(nid, index_tokens)
+                    for e in edges:
+                        if isinstance(e, str):
+                            # 旧格式兼容：字符串边转 dict
+                            try:
+                                e = json.loads(e)
+                            except (json.JSONDecodeError, TypeError):
+                                e = {"target": None, "type": EDGE_RELATED, "weight": 1.0}
+                        if not isinstance(e, dict):
+                            continue
+                        self.adj[nid].append(e)
+                        target = e.get("target")
+                        if target is not None:
+                            self.adj.setdefault(target, []).append(
+                                {"target": nid, "type": e.get("type", EDGE_RELATED), "weight": e.get("weight", 1.0)}
+                            )
             self._next_id = (max((n["id"] for n in self.nodes), default=0) + 1)
         except sqlite3.OperationalError:
             self._migrate_from_json()
@@ -334,7 +560,7 @@ class MemoryStore:
                         edges = n.get("edges", [])
                         tags = n.get("tags", [])
                         conn.execute(
-                            """INSERT INTO nodes (id, text, workspace, category, simhash,
+                            """INSERT OR IGNORE INTO nodes (id, text, workspace, category, simhash,
                                access_count, tags, confidence, created_at, learned_at,
                                updated_at, last_accessed_at, session_id, source, edges_json)
                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -359,7 +585,7 @@ class MemoryStore:
                     conn.commit()
                     json_path.rename(json_path.with_suffix(".json.migrated"))
             except Exception:
-                pass
+                import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
         self._init_db()
 
     def save(self):
@@ -371,69 +597,119 @@ class MemoryStore:
         workspace = workspace or self.ws
         if not category:
             category = self._cat(text)
-        nid = self._next_id
-        self._next_id += 1
-        sh = SimHash.hash(text)
+
+        index_tokens = SimHash.tokens(text)
+        text_jieba = " ".join(index_tokens) if _HAS_JIEBA else ""
+        sh = SimHash.hash_tokens(index_tokens)
         bk = SimHash.bucket(sh)
-        node = {
-            "id": nid, "text": text, "workspace": workspace, "category": category, "simhash": sh,
-            "access_count": 0, "tags": [], "confidence": confidence,
-            "created_at": now, "learned_at": now, "updated_at": None, "last_accessed_at": None,
-            "session_id": session_id, "source": source, "edges": [],
-        }
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT INTO nodes (id, text, workspace, category, simhash,
-               access_count, tags, confidence, created_at, learned_at,
-               updated_at, last_accessed_at, session_id, source, edges_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                nid, text, workspace, category, sh,
-                0, "[]", confidence, now, now,
-                None, None, session_id, source, "[]",
-            ),
-        )
-        conn.commit()
-        self.nodes.append(node)
-        self.node_pos[nid] = len(self.nodes) - 1
-        self.hash_idx[sh] = nid
-        self.adj[nid] = []
-        self.sh_buckets.setdefault(bk, []).append(nid)
-        for kw in SimHash.tokens(text):
-            self.kw_idx.setdefault(kw, []).append(nid)
-        self.lsh.insert(nid, text)
+
+        with self._write_lock:
+            conn = self._get_conn()
+
+            # Let SQLite allocate ids. In a shared multi-Agent DB, self._next_id can
+            # become stale while other Agents or background jobs insert rows.
+            try:
+                cur = conn.execute(
+                    """INSERT INTO nodes (text, workspace, category, simhash,
+                       access_count, tags, confidence, created_at, learned_at,
+                       updated_at, last_accessed_at, session_id, source, edges_json, text_jieba)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        text, workspace, category, sh,
+                        0, "[]", confidence, now, now,
+                        None, None, session_id, source, "[]", text_jieba,
+                    ),
+                )
+            except sqlite3.OperationalError:
+                cur = conn.execute(
+                    """INSERT INTO nodes (text, workspace, category, simhash,
+                       access_count, tags, confidence, created_at, learned_at,
+                       updated_at, last_accessed_at, session_id, source, edges_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        text, workspace, category, sh,
+                        0, "[]", confidence, now, now,
+                        None, None, session_id, source, "[]",
+                    ),
+                )
+            conn.commit()
+
+            nid = int(cur.lastrowid)
+            self._next_id = max(self._next_id, nid + 1)
+            node = {
+                "id": nid, "text": text, "workspace": workspace, "category": category, "simhash": sh,
+                "access_count": 0, "tags": [], "confidence": confidence,
+                "created_at": now, "learned_at": now, "updated_at": None, "last_accessed_at": None,
+                "session_id": session_id, "source": source, "edges": [],
+            }
+            self.nodes.append(node)
+            self.node_pos[nid] = len(self.nodes) - 1
+            self.hash_idx[sh] = nid
+            self.adj[nid] = []
+            self.sh_buckets.setdefault(bk, []).append(nid)
+            self._index_node_tokens(nid, index_tokens)
+        try:
+            self._auto_link(nid, text, workspace, category)
+        except Exception:
+            import logging as _logging
+            _logging.getLogger("zhiluo.engine").warning(
+                "_auto_link failed for nid=%s", nid, exc_info=True)
         return nid
+    def _auto_link(self, nid, text, workspace, category, max_links=5, min_sim=0.35):
+        """Create bidirectional related edges to similar existing knowledge."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT id, text FROM nodes
+               WHERE workspace=? AND category=? AND id != ?
+               ORDER BY id DESC LIMIT 100""",
+            (workspace, category, nid),
+        ).fetchall()
+        if not rows:
+            return
+        try:
+            from semantic_base import semantic_find_similar
+            candidates = [(r["id"], r["text"]) for r in rows[:50]]
+            matches = semantic_find_similar(text, candidates, top_k=max_links)
+        except Exception:
+            import logging as _logging
+            _logging.getLogger("zhiluo.engine").warning(
+                "_auto_link semantic_find_similar failed", exc_info=True)
+            return
+        for match_id, _match_text, match_score in matches or []:
+            if match_score < min_sim:
+                continue
+            self.add_edge(nid, match_id, "related", weight=match_score)
+            self.add_edge(match_id, nid, "related", weight=match_score)
 
     def get(self, nid):
         i = self.node_pos.get(nid)
         return self.nodes[i] if i is not None else None
 
     def delete(self, nid):
-        i = self.node_pos.pop(nid, None)
-        if i is None:
-            return False
-        n = self.nodes[i]
-        sh = n.get("simhash", 0)
-        self.hash_idx.pop(sh, None)
-        try:
-            self.sh_buckets.get(SimHash.bucket(sh), []).remove(nid)
-        except ValueError:
-            pass
-        for kw in SimHash.tokens(n.get("text", "")):
+        with self._write_lock:
+            i = self.node_pos.get(nid)
+            if i is None:
+                return False
+            # v8.9.7: 先删 DB，成功后再清内存，防止 DB 删除失败导致状态不一致
+            conn = self._get_conn()
+            conn.execute("DELETE FROM nodes WHERE id=?", (nid,))
+            conn.commit()
+            n = self.nodes[i]
+            sh = n.get("simhash", 0)
+            self.hash_idx.pop(sh, None)
             try:
-                self.kw_idx.get(kw, []).remove(nid)
+                self.sh_buckets.get(SimHash.bucket(sh), []).remove(nid)
             except ValueError:
                 pass
-        self.adj.pop(nid, None)
-        for e in n.get("edges", []):
-            target = e.get("target")
-            if target in self.adj:
-                self.adj[target] = [e2 for e2 in self.adj[target] if e2.get("target") != nid]
-        self.nodes[i] = None
-        conn = self._get_conn()
-        conn.execute("DELETE FROM nodes WHERE id=?", (nid,))
-        conn.commit()
-        return True
+            self._remove_node_tokens(nid, self._cached_tokens(n))
+            self.adj.pop(nid, None)
+            for e in n.get("edges", []):
+                target = e.get("target")
+                if target in self.adj:
+                    self.adj[target] = [e2 for e2 in self.adj[target] if e2.get("target") != nid]
+            self.nodes[i] = None
+            self.node_pos.pop(nid, None)
+            return True
 
     def touch(self, nid):
         n = self.get(nid)
@@ -446,18 +722,68 @@ class MemoryStore:
                          (n["access_count"], now, nid))
             conn.commit()
 
+    def decay_confidence(self, workspace=None, stale_days=30, decay_rate=0.9, dry_run=False):
+        """P1.2: 降低长期未访问知识的信任度（trust_score 优先，回退 confidence）。
+        
+        越久未访问→衰减越大；高访问量→抵抗衰减（被反复验证的知识不应轻易降权）。
+        """
+        ws = workspace or self.ws
+        stale_since = (datetime.now() - timedelta(days=stale_days)).isoformat()
+        conn = self._get_conn()
+        # v8.9.7: BEGIN IMMEDIATE 确保衰减原子化 — 崩溃不产生部分衰减
+        if not dry_run:
+            conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                """SELECT id, trust_score, confidence, access_count, last_accessed_at
+                   FROM nodes WHERE workspace=?
+                   AND (last_accessed_at IS NULL OR last_accessed_at < ?)
+                   AND COALESCE(trust_score, confidence, 1.0) > 0.1""",
+                (ws, stale_since),
+            ).fetchall()
+            affected = 0
+            for r in rows:
+                trust = float(r["trust_score"] or r["confidence"] or 1.0)
+                access = int(r["access_count"] or 0)
+                # 高访问量减缓衰减：access>=10 时衰减率减半
+                effective_rate = decay_rate + (1.0 - decay_rate) * min(1.0, access / 20.0) * 0.5
+                new_trust = round(max(0.1, trust * effective_rate), 2)
+                if abs(new_trust - trust) < 0.01:
+                    continue
+                if not dry_run:
+                    conn.execute(
+                        "UPDATE nodes SET trust_score=?, confidence=?, updated_at=? WHERE id=?",
+                        (new_trust, new_trust, datetime.now().isoformat(), r["id"]),
+                    )
+                    i = self.node_pos.get(r["id"])
+                    if i is not None and self.nodes[i] is not None:
+                        self.nodes[i]["trust_score"] = new_trust
+                        self.nodes[i]["confidence"] = new_trust
+                affected += 1
+            if not dry_run:
+                conn.commit()
+        except Exception:
+            if not dry_run:
+                conn.rollback()
+            raise
+        return {"affected": affected, "stale_days": stale_days, "decay_rate": decay_rate}
+
     def _cat(self, text):
-        rules = [
-            ("技术", ["python", "java", "代码", "bug", "接口", "api", "服务器", "数据库", "前端", "后端", "框架"]),
-            ("项目", ["项目", "截止", "里程碑", "需求", "排期", "负责人", "上线", "迭代", "版本"]),
-            ("人物", ["老板", "经理", "同事", "小王", "小李", "团队", "客户", "领导", "总监"]),
-            ("财务", ["元", "万", "预算", "收入", "支出", "利润", "成本", "报销", "发票"]),
-            ("会议", ["会议", "开会", "纪要", "讨论", "决议", "参会", "议程"]),
-            ("学习", ["学习", "教程", "课程", "笔记", "知识点", "总结", "教程", "文档"]),
-            ("生活", ["健身", "做饭", "菜谱", "运动", "饮食", "休息", "旅行"]),
-        ]
+        try:
+            from knowledge_maintenance import _load_rules
+            rules = _load_rules(self.path)
+        except Exception:
+            rules = [
+                ("技术", ["python", "java", "代码", "bug", "接口", "api", "服务器", "数据库", "前端", "后端", "框架"]),
+                ("项目", ["项目", "截止", "里程碑", "需求", "排期", "负责人", "上线", "迭代", "版本"]),
+                ("人物", ["老板", "经理", "同事", "小王", "小李", "团队", "客户", "领导", "总监"]),
+                ("财务", ["元", "万", "预算", "收入", "支出", "利润", "成本", "报销", "发票"]),
+                ("会议", ["会议", "开会", "纪要", "讨论", "决议", "参会", "议程"]),
+                ("学习", ["学习", "教程", "课程", "笔记", "知识点", "总结", "教程", "文档"]),
+                ("生活", ["健身", "做饭", "菜谱", "运动", "饮食", "休息", "旅行"]),
+            ]
         low = text.lower()
-        best = "未分类"
+        best = "_待分类_"
         bs = 0
         for cat, kws in rules:
             s = sum(1 for kw in kws if kw in low)
@@ -468,11 +794,17 @@ class MemoryStore:
 
     def stats(self):
         v = [n for n in self.nodes if n]
+        edge_count = sum(len(n.get("edges", [])) for n in v)
+        try:
+            from knowledge_maintenance import edge_stats
+            edge_count = edge_stats(self.path).get("directed_edges", edge_count)
+        except Exception:
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
         return {
             "total": len(v),
             "workspaces": dict(Counter(n["workspace"] for n in v)),
             "categories": dict(Counter(n["category"] for n in v)),
-            "edges": sum(len(n.get("edges", [])) for n in v),
+            "edges": edge_count,
         }
 
     def valid(self, workspace=None):
@@ -482,20 +814,23 @@ class MemoryStore:
         return r
 
     def switch_ws(self, workspace):
-        self.save()
-        self._close_conn()
-        self.ws = workspace
-        self.path = WS_DIR / f"{workspace}.db"
-        self.nodes = []
-        self._init_db()
-        self.load()
+        workspace = validate_workspace_name(workspace)
+        # v8.9.7: 加写锁防止并发读看到空 nodes
+        with self._write_lock:
+            self.save()
+            self._close_conn()
+            self.ws = workspace
+            self.path = safe_workspace_db_path(WS_DIR, workspace)
+            self.nodes = []
+            self._init_db()
+            self.load()
         idx = set()
         idx_file = DATA_DIR / ".ws_index"
         if idx_file.exists():
             try:
                 idx = set(json.loads(idx_file.read_text(encoding="utf-8")))
             except Exception:
-                pass
+                import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
         idx.add(workspace)
         idx_file.write_text(json.dumps(list(idx)), encoding="utf-8")
 
@@ -504,7 +839,8 @@ class MemoryStore:
         if not idx_file.exists():
             return ["global"]
         try:
-            return json.loads(idx_file.read_text(encoding="utf-8"))
+            names = json.loads(idx_file.read_text(encoding="utf-8"))
+            return [validate_workspace_name(n) for n in names]
         except Exception:
             return ["global"]
 
@@ -513,18 +849,26 @@ class MemoryStore:
             return []
         conn = self._get_conn()
         q = query.strip()
+        
+        # v8.9: jieba分词查询词，用于FTS5
+        if _HAS_JIEBA and len(q) > 2:
+            q_jieba = " ".join(smart_tokenize(q))
+        else:
+            q_jieba = q
+        
         if len(q) <= 2:
             pattern = "%" + q + "%"
             try:
+                # v8.9: 同时搜索text和category字段
                 if workspace:
                     cursor = conn.execute(
-                        "SELECT * FROM nodes WHERE text LIKE ? AND workspace=? ORDER BY id LIMIT ?",
-                        (pattern, workspace, top_k),
+                        "SELECT * FROM nodes WHERE (text LIKE ? OR category LIKE ?) AND workspace=? ORDER BY id LIMIT ?",
+                        (pattern, pattern, workspace, top_k),
                     )
                 else:
                     cursor = conn.execute(
-                        "SELECT * FROM nodes WHERE text LIKE ? ORDER BY id LIMIT ?",
-                        (pattern, top_k),
+                        "SELECT * FROM nodes WHERE (text LIKE ? OR category LIKE ?) ORDER BY id LIMIT ?",
+                        (pattern, pattern, top_k),
                     )
                 results = []
                 for row in cursor.fetchall():
@@ -545,6 +889,7 @@ class MemoryStore:
             except Exception:
                 return []
         try:
+            # v8.9: 尝试用jieba分词查询FTS，失败回退LIKE
             if workspace:
                 cursor = conn.execute(
                     """SELECT n.*, rank FROM nodes_fts f
@@ -552,7 +897,7 @@ class MemoryStore:
                        WHERE nodes_fts MATCH ? AND n.workspace = ?
                        ORDER BY rank
                        LIMIT ?""",
-                    (q, workspace, top_k),
+                    (q_jieba, workspace, top_k),
                 )
             else:
                 cursor = conn.execute(
@@ -561,7 +906,7 @@ class MemoryStore:
                        WHERE nodes_fts MATCH ?
                        ORDER BY rank
                        LIMIT ?""",
-                    (q, top_k),
+                    (q_jieba, top_k),
                 )
             results = []
             for row in cursor.fetchall():
@@ -584,59 +929,68 @@ class MemoryStore:
             return []
 
     def add_edge(self, sid, tid, etype=EDGE_RELATED, weight=1.0):
-        src = self.get(sid)
-        tgt = self.get(tid)
-        if not src or not tgt:
-            return False
-        edge = {"target": tid, "type": etype, "weight": weight}
-        for e in src.get("edges", []):
-            if e.get("target") == tid and e.get("type") == etype:
+        with self._write_lock:
+            src = self.get(sid)
+            tgt = self.get(tid)
+            if not src or not tgt:
                 return False
-        src["edges"].append(edge)
-        self.adj.setdefault(sid, []).append(edge)
-        self.adj.setdefault(tid, []).append(
-            {"target": sid, "type": etype, "weight": weight}
-        )
-        conn = self._get_conn()
-        conn.execute("UPDATE nodes SET edges_json=? WHERE id=?",
-                     (json.dumps(src["edges"], ensure_ascii=False), sid))
-        conn.commit()
-        return True
+            edge = {"target": tid, "type": etype, "weight": weight}
+            for e in src.get("edges", []):
+                if e.get("target") == tid and e.get("type") == etype:
+                    return False
+            src["edges"].append(edge)
+            self.adj.setdefault(sid, []).append(edge)
+            self.adj.setdefault(tid, []).append(
+                {"target": sid, "type": etype, "weight": weight}
+            )
+            conn = self._get_conn()
+            conn.execute("UPDATE nodes SET edges_json=? WHERE id=?",
+                         (json.dumps(src["edges"], ensure_ascii=False), sid))
+            conn.commit()
+            return True
 
     def remove_edge(self, sid, tid, etype=EDGE_RELATED):
-        src = self.get(sid)
-        if not src:
-            return False
-        src["edges"] = [e for e in src.get("edges", [])
-                        if not (e.get("target") == tid and e.get("type") == etype)]
-        if tid in self.adj:
-            self.adj[tid] = [e for e in self.adj[tid]
-                             if not (e.get("target") == sid and e.get("type") == etype)]
-        conn = self._get_conn()
-        conn.execute("UPDATE nodes SET edges_json=? WHERE id=?",
-                     (json.dumps(src["edges"], ensure_ascii=False), sid))
-        conn.commit()
-        return True
+        with self._write_lock:
+            src = self.get(sid)
+            if not src:
+                return False
+            src["edges"] = [e for e in src.get("edges", [])
+                            if not (e.get("target") == tid and e.get("type") == etype)]
+            if tid in self.adj:
+                self.adj[tid] = [e for e in self.adj[tid]
+                                 if not (e.get("target") == sid and e.get("type") == etype)]
+            conn = self._get_conn()
+            conn.execute("UPDATE nodes SET edges_json=? WHERE id=?",
+                         (json.dumps(src["edges"], ensure_ascii=False), sid))
+            conn.commit()
+            return True
 
     def update(self, nid, **kwargs):
         n = self.get(nid)
         if not n:
             return False
-        conn = self._get_conn()
-        set_clauses = []
-        params = []
-        for key, val in kwargs.items():
-            if key in ("tags",):
-                val = json.dumps(val, ensure_ascii=False)
-            n[key] = kwargs[key]
-            set_clauses.append(f"{key}=?")
-            params.append(val)
-        if not set_clauses:
-            return False
-        params.append(nid)
-        conn.execute(f"UPDATE nodes SET {', '.join(set_clauses)} WHERE id=?", params)
-        conn.commit()
-        return True
+        with self._write_lock:
+            conn = self._get_conn()
+            set_clauses = []
+            params = []
+            for key, val in kwargs.items():
+                # v8.9.7: 列名白名单校验，防 SQL 注入
+                if key not in self._ALLOWED_COLUMNS:
+                    import logging as _logging
+                    _logging.getLogger("zhiluo.engine").warning(
+                        "update() rejected column: %s", key)
+                    raise ValidationError(f"Invalid column for update: {key}")
+                if key in ("tags",):
+                    val = json.dumps(val, ensure_ascii=False)
+                n[key] = val
+                set_clauses.append(f"{key}=?")
+                params.append(val)
+            if not set_clauses:
+                return False
+            params.append(nid)
+            conn.execute(f"UPDATE nodes SET {', '.join(set_clauses)} WHERE id=?", params)
+            conn.commit()
+            return True
 
     # === 超级版新增: pending待确认队列 (来自左脑v3.0) ===
     def add_pending(self, text, category=None, source="auto"):
@@ -663,10 +1017,46 @@ class MemoryStore:
         if not row:
             return None
         row = dict(row)
-        conn.execute("DELETE FROM pending WHERE id=?", (pid,))
-        conn.commit()
+        # v8.9.7: 先执行 add()，成功后再删除 pending 行，防止 add 失败导致数据丢失
         if promote:
-            return self.add(row["content"], self.ws, session_id="pending-" + pid)
+            nid = self.add(
+                row["content"],
+                self.ws,
+                category=row.get("category") or None,
+                source=row.get("source") or "auto",
+                session_id="pending-" + pid,
+            )
+            try:
+                source_url = row.get("source_url") or ""
+                if not source_url and str(row.get("source") or "").lower().startswith(("http://", "https://")):
+                    source_url = row.get("source") or ""
+                content_hash = row.get("content_hash") or ""
+                if not content_hash:
+                    normalized = re.sub(r"https?://\S+", "", row.get("content") or "", flags=re.I)
+                    normalized = re.sub(r"\b\d{4}[-/年]\d{1,2}[-/月]\d{1,2}日?\b", "", normalized)
+                    normalized = re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?\b", "", normalized)
+                    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+                    content_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+                updates = []
+                params = []
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(nodes)").fetchall()}
+                if source_url and "source_url" in cols:
+                    updates.append("source_url=?")
+                    params.append(source_url)
+                if content_hash and "content_hash" in cols:
+                    updates.append("content_hash=?")
+                    params.append(content_hash)
+                if updates:
+                    updates.append("updated_at=?")
+                    params.extend([datetime.now().isoformat(), nid])
+                    conn.execute("UPDATE nodes SET %s WHERE id=?" % ", ".join(updates), params)
+                    conn.commit()
+            except Exception:
+                import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
+            # v8.9.7: add 成功后才删除 pending，防止 add 失败导致数据丢失
+            conn.execute("DELETE FROM pending WHERE id=?", (pid,))
+            conn.commit()
+            return nid
         return None
 
     def pending_reject(self, pid):
@@ -787,6 +1177,20 @@ def find(store, query, workspace=None):
                 results.append(n)
     if len(results) < 3:
         try:
+            from vector import vec_search, _ensure_vec
+            conn = store._get_conn()
+            if _ensure_vec(conn):
+                for nid, dist in vec_search(conn, query, top_k=5):
+                    if nid not in seen:
+                        n = store.get(nid)
+                        if n:
+                            n['_semantic'] = round(max(0, 1 - dist), 4)
+                            seen.add(nid)
+                            results.append(n)
+        except Exception:
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
+    if len(results) < 3:
+        try:
             from vector import semantic_find
             for n in semantic_find(store, query, workspace, top_k=5):
                 if n['id'] not in seen:
@@ -839,8 +1243,14 @@ def diffuse(store, query, workspace=None, hops=2):
             result.append(n)
     return result[:15]
 
-def pagerank(store, damping=0.85, iterations=20):
-    nodes = store.valid()
+def pagerank(store, damping=0.85, iterations=20, exclude_categories=None):
+    if exclude_categories is None:
+        exclude_categories = {"测试数据"}
+    nodes = [
+        n for n in store.valid()
+        if (n.get("category") or "") not in exclude_categories
+        and (n.get("status") or "active") not in {"archived", "merged"}
+    ]
     if not nodes:
         return []
     nids = [n["id"] for n in nodes]
@@ -945,8 +1355,14 @@ def conflicts(store):
 
     # L2: SimHash 语义对立（Bug5修复：桶预筛 + 节点上限，避免O(n²)爆炸）
     # 先按SimHash桶分组，只比较同桶节点（汉明距离<=12大概率在同桶或相邻桶）
-    _L2_MAX_NODES = 500  # 超过此数量时截断，避免数千节点时卡死
-    l2_nodes = nodes if len(nodes) <= _L2_MAX_NODES else nodes[:_L2_MAX_NODES]
+    try:
+        _L2_MAX_NODES = max(0, int(os.environ.get("ZHILUO_CONFLICT_L2_MAX_NODES", "500") or "500"))
+    except Exception:
+        _L2_MAX_NODES = 500
+    if os.environ.get("ZHILUO_CONFLICT_L2_ENABLE", "1") == "0" or _L2_MAX_NODES == 0:
+        l2_nodes = []
+    else:
+        l2_nodes = nodes if len(nodes) <= _L2_MAX_NODES else nodes[:_L2_MAX_NODES]
     # 建桶索引：同一桶内的节点才需要两两比较
     bucket_map = defaultdict(list)
     for n in l2_nodes:
@@ -1037,7 +1453,7 @@ def consolidate(store, old_text, new_text, llm_func=None):
             if merged and len(merged) > 5:
                 return merged.strip()
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
     # 规则合并：新文本追加旧文本中独有的信息
     old_toks = set(SimHash.tokens(old_text))
     new_toks = set(SimHash.tokens(new_text))
@@ -1199,7 +1615,7 @@ class SelfCheck:
         # === 超级版新增: 自动修复 ===
         fixes = self._auto_repair()
         fix_str = f"\n [修复] {', '.join(fixes)}" if fixes else ""
-        return {"report": "\n".join(["[Z] 知络 v8.3 自检", "=" * 30] + self.r + ["", f" [OK]{p} [W]{w} [X]{len(self.r) - p - w}{fix_str}"]), "passed": p, "warned": w}
+        return {"report": "\n".join(["[Z] 知络 v8.9.1 自检", "=" * 30] + self.r + ["", f" [OK]{p} [W]{w} [X]{len(self.r) - p - w}{fix_str}"]), "passed": p, "warned": w}
 
     def _db(self):
         t = len(self.st.valid())
@@ -1279,7 +1695,7 @@ class SelfCheck:
                 conn.commit()
                 fixes.append(f"清理{empty}条空白待确认")
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
 
         # 修复2: 补全缺失的SimHash
         missing = 0
@@ -1310,7 +1726,7 @@ class SelfCheck:
                 conn.commit()
                 fixes.append(f"FTS5索引已重建(差{abs(fts_count-node_count)})")
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
 
         # 修复5: 去重重复边 (同一source+target+type出现多次)
         try:
@@ -1335,7 +1751,7 @@ class SelfCheck:
                 self.st.save()
                 fixes.append(f"去重{dup_count}条重复边")
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
 
         # 修复6: 删除自环边 (节点指向自己)
         try:
@@ -1354,7 +1770,7 @@ class SelfCheck:
                 self.st.save()
                 fixes.append(f"删除{self_loop_count}条自环边")
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
 
         # 修复7: 清理孤儿变更历史 (引用了已删除节点的历史记录)
         try:
@@ -1367,7 +1783,7 @@ class SelfCheck:
                 conn.commit()
                 fixes.append(f"清理{len(orphan_ids)}条孤儿历史")
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
 
         # 修复8: WAL文件压缩 (超过10MB时checkpoint)
         try:
@@ -1379,7 +1795,7 @@ class SelfCheck:
                     conn.commit()
                     fixes.append(f"WAL已压缩({size_mb:.1f}MB)")
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
 
         return fixes
 
@@ -1393,7 +1809,8 @@ def activate_license(code=None):
 # ====================== 主入口 ======================
 class ZhiLuo:
     def __init__(self, path=None, workspace="global"):
-        self.s = MemoryStore(path)
+        workspace = validate_workspace_name(workspace)
+        self.s = MemoryStore(path, workspace=workspace)
         self.ws = workspace
         self.session_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex()
         self._llm_func = None
@@ -1408,16 +1825,113 @@ class ZhiLuo:
         """设置 LLM 合并函数（可选）"""
         self._llm_func = func
 
+    def _extract_and_link(self, nid, text):
+        """从文本提取关系并建立语义边（有LLM走LLM，无LLM降级规则）"""
+        try:
+            if self._llm_func:
+                from relation_extractor import extract_with_llm
+                rels = extract_with_llm(text, self._llm_func)
+            else:
+                from relation_extractor import extract_relations
+                rels = extract_relations(text)
+            if not rels:
+                return
+            for r in rels:
+                src_name = r.get("source", "")
+                tgt_name = r.get("target", "")
+                rtype = r.get("relation", "related")
+                weight = r.get("weight", 0.5)
+                if not src_name or not tgt_name or src_name == tgt_name:
+                    continue
+                src_id = self._find_node_by_text(src_name, exclude=nid)
+                tgt_id = self._find_node_by_text(tgt_name, exclude=nid)
+                if src_id and tgt_id:
+                    self.s.add_edge(src_id, tgt_id, etype=rtype, weight=weight)
+        except Exception:
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
+
+    def _find_node_by_text(self, keyword, exclude=None):
+        """按文本模糊查找节点，精确匹配优先"""
+        best = None
+        for n in self.s.valid():
+            if exclude is not None and n["id"] == exclude:
+                continue
+            text = n.get("text", "")
+            if text == keyword:
+                return n["id"]
+            if keyword in text and best is None:
+                best = n["id"]
+            try:
+                import jieba
+                for tok in jieba.lcut(keyword):
+                    if tok in text and len(tok) >= 2:
+                        if best is None:
+                            best = n["id"]
+            except Exception:
+                import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
+        return best
+
     def _sync_co_net(self, text):
         """写入时同步共现网络"""
         try:
             if self.brain and hasattr(self.brain, 'co_net'):
                 self.brain.co_net.learn(text, source='learn')
         except Exception:
-            pass
+            import logging as _logging; _logging.getLogger("zhiluo.engine").warning("engine.py: swallowed exception", exc_info=True)
 
     def run(self, text):
+        """旧通道：自然语言意图路由。保留向后兼容。"""
         return self._exec(Intent.classify(text), text)
+
+    # v8.9.7: 新通道 — 结构化调用，语义化参数，可被 linter/IDE 检查
+    def call(self, action, **kwargs):
+        """新通道：显式 action + 关键字参数调用知络引擎。
+        
+        用法:
+          lb.call("learn", text="一条知识")
+          lb.call("query", keyword="搜索词")
+          lb.call("search", keyword="关联词", mode="graph")
+          lb.call("analyze", mode="conflicts")
+          lb.call("summarize", text="长文本")
+          lb.call("visualize", keyword="可选关键词")
+          lb.call("delete", nid=123)
+        
+        旧通道 lb.run() 仍可用。新通道支持 IDE 自动补全和类型检查。
+        """
+        if action == "learn":
+            return self._exec("learn", kwargs.get("text", ""))
+        if action == "query":
+            return self._exec("query", kwargs.get("keyword", ""))
+        if action == "search":
+            return self._exec("search", kwargs.get("keyword", ""))
+        if action == "analyze":
+            mode = kwargs.get("mode", "")
+            if mode == "conflicts":
+                return self._exec("analyze", "冲突")
+            if mode == "decay":
+                return self._exec("analyze", "衰减")
+            return self._exec("analyze", kwargs.get("text", ""))
+        if action == "summarize":
+            return self._exec("summarize", kwargs.get("text", ""))
+        if action == "visualize":
+            return self._exec("visualize", kwargs.get("keyword", ""))
+        if action == "update":
+            return self._exec("update", kwargs.get("text", ""))
+        if action == "delete":
+            nid = kwargs.get("nid")
+            if nid:
+                self.s.delete(int(nid))
+                self.s.save()
+                return f"[Z] 已删除 #{nid}"
+            return self._exec("delete", kwargs.get("text", ""))
+        if action == "pagerank":
+            return self._exec("pagerank", kwargs.get("text", ""))
+        if action == "pending":
+            return self._exec("pending", kwargs.get("text", ""))
+        if action in ("confirm", "entangle", "auto_learn", "manage", "trace", "correct"):
+            return self._exec(action, kwargs.get("text", ""))
+        # 兜底：回退到旧通道
+        return self._exec(action, kwargs.get("text", action))
 
     def _exec(self, a, args):
         try:
@@ -1438,9 +1952,9 @@ class ZhiLuo:
                         self._sync_co_net(p)
                         return f"[Z] 已合并更新 #{nid}"
                 # 第二层：MinHashLSH 近似去重（优化4）
-                for nid in self.s.lsh.query(p):
-                    n = self.s.get(nid)
-                    if n and n["id"] != nid:
+                for candidate_nid in self.s.lsh.query(p):
+                    n = self.s.get(candidate_nid)
+                    if n:  # v8.9.7: 修复死代码 — 原 `n["id"] != nid` 恒为 False
                         jac = self.s.lsh.jaccard(p, n.get("text", ""))
                         if jac > 0.5:
                             merged = consolidate(self.s, n["text"], p, self._llm_func)
@@ -1448,11 +1962,13 @@ class ZhiLuo:
                             n["updated_at"] = datetime.now().isoformat()
                             self.s.save()
                             self._sync_co_net(p)
-                            return f"[Z] 已合并更新 #{nid} (相似度{jac:.0%})"
+                            return f"[Z] 已合并更新 #{n['id']} (相似度{jac:.0%})"
                 nid = self.s.add(p, self.ws, session_id=self.session_id)
                 if len(SimHash.tokens(p)) >= 2:
                     self.s.get(nid)["tags"] = auto_tfidf(self.s, p).get("tags", [])
                 self.s.save()
+                # ── 新增：关系提取+建边 ──
+                self._extract_and_link(nid, p)
                 self._sync_co_net(p)
                 return f"[Z] 已记住 #{nid}（{self.s.get(nid)['category']}）"
             elif a == "query":
@@ -1642,10 +2158,12 @@ class ZhiLuo:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         p = DATA_DIR / f"export_{ts}.{fmt}"
         if fmt == "json":
-            json.dump({"nodes": nodes}, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            with open(p, "w", encoding="utf-8") as _f:
+                json.dump({"nodes": nodes}, _f, ensure_ascii=False, indent=2)
         elif fmt == "csv":
             import csv
-            w = csv.writer(open(p, "w", encoding="utf-8-sig", newline=""))
+            with open(p, "w", encoding="utf-8-sig", newline="") as _f:
+                w = csv.writer(_f)
             w.writerow(["id", "workspace", "category", "text", "tags", "confidence", "learned_at"])
             for n in nodes:
                 w.writerow([n["id"], n["workspace"], n["category"], n["text"], n.get("tags", ""), n["confidence"], n["learned_at"]])
@@ -1698,15 +2216,19 @@ class ZhiLuo:
 
 
 def main():
-    lb = ZhiLuo()
     if len(sys.argv) > 1:
+        lb = ZhiLuo()
         r = lb.run(" ".join(sys.argv[1:]))
         try:
             print(r)
-        except Exception:
-            print(r.encode("ascii", errors="replace").decode())
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write((str(r) + "\n").encode("utf-8", errors="strict"))
     else:
-        print("[Z] 知络 v8.3 开源版")
+        if os.environ.get("ZHILUO_ALLOW_REPL", "0") != "1":
+            print("[Z] REPL 默认关闭，已跳过。设置 ZHILUO_ALLOW_REPL=1 才进入交互模式。", file=sys.stderr)
+            return
+        lb = ZhiLuo()
+        print("[Z] 知络 v8.9.1 统一版")
         while True:
             try:
                 l = input(">>> ").strip()
@@ -1716,10 +2238,31 @@ def main():
                     r = lb.run(l)
                     try:
                         print(r)
-                    except Exception:
-                        print(r.encode("ascii", errors="replace").decode())
+                    except UnicodeEncodeError:
+                        sys.stdout.buffer.write((str(r) + "\n").encode("utf-8", errors="strict"))
             except (EOFError, KeyboardInterrupt):
                 break
 
 if __name__ == "__main__":
     main()
+
+# === @deprecated v8.9.7 — 中期预留接口，未实现，保留供参考 ===
+class VectorBackend:
+    def search(self, text, top_k=20):
+        raise NotImplementedError
+    def add(self, nid, text):
+        raise NotImplementedError
+    def delete(self, nid):
+        raise NotImplementedError
+
+
+# v8.9.7: 语义化别名 — 解决同名函数在多个模块中签名冲突的问题。
+# 旧名保留向后兼容，新代码推荐使用语义化别名。
+search_knowledge = find           # 关键词检索（原名 find，与 MinHashLSH.find 区分）
+search_graph = diffuse            # 图谱扩散搜索（原名 diffuse）
+detect_conflicts = conflicts      # 三重冲突检测（原名 conflicts）
+rank_importance = pagerank        # PageRank 枢纽排名（原名 pagerank）
+visualize_graph = mermaid_graph   # Mermaid 图谱可视化（原名 mermaid_graph）
+merge_memories = consolidate      # LLM 记忆合并（原名 consolidate）
+
+
